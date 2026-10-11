@@ -163,7 +163,11 @@ client.once('clientReady', async () => {
         // ponytail: 반응자 100명까지만 가져옴, 더 많아지면 after로 페이지네이션
         const users = await msg.reactions.cache.get(EMOJI)?.users.fetch();
         const mentions = users?.filter(u => !u.bot).map(u => `<@${u.id}>`) ?? [];
-        if (mentions.length) await channel.send(`${mentions.join(' ')}\n${alarm.text}`);
+        if (mentions.length) {
+          const sent = await channel.send(`${mentions.join(' ')}\n${alarm.text}`);
+          // ponytail: 30분 안에 봇이 재시작되면 그 메시지는 안 지워짐, 문제되면 보낸 메시지 ID를 파일에 저장
+          setTimeout(() => sent.delete().catch(() => {}), 30 * 60_000);
+        }
       } catch (e) {
         console.error(alarm.name, e);
       }
