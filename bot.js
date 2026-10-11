@@ -1,4 +1,4 @@
-import { Client, GatewayIntentBits, MessageFlags, PermissionFlagsBits, SlashCommandBuilder } from 'discord.js';
+import { ChannelType, Client, GatewayIntentBits, MessageFlags, PermissionFlagsBits, SlashCommandBuilder } from 'discord.js';
 import fs from 'node:fs';
 
 const FILE = 'alarms.json';
@@ -48,65 +48,80 @@ const commands = [
     .addStringOption(o => o.setName('이름').setDescription('예: 보스').setRequired(true))
     .addStringOption(o => o.setName('시간').setDescription('한국시간 HH:MM (예: 21:50)').setRequired(true))
     .addStringOption(o => o.setName('내용').setDescription('알림 때 보낼 문구').setRequired(true))
-    .addStringOption(o => o.setName('요일').setDescription('예: 토 / 월,수,금 (비우면 매일)')),
+    .addStringOption(o => o.setName('요일').setDescription('예: 토 / 월,수,금 (비우면 매일)'))
+    .addChannelOption(o => o.setName('채널').setDescription('알림 보낼 채널 (비우면 지금 채널)')
+      .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)),
   new SlashCommandBuilder().setName('알림삭제').setDescription('알림을 삭제합니다').setDefaultMemberPermissions(admin)
     .addStringOption(o => o.setName('이름').setDescription('삭제할 알림').setRequired(true).setAutocomplete(true)),
 ];
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-let channel;
+
+// 서버마다 명령어 등록 (서버 명령어라 바로 반영됨) + 닉네임 설정
+async function setupGuild(guild) {
+  await guild.commands.set(commands);
+  await guild.members.me.setNickname('좋은하루').catch(e => console.error('닉네임 변경 실패', guild.name, e.message));
+}
+client.on('guildCreate', setupGuild);
 
 client.on('interactionCreate', async i => {
+  const mine = alarms.filter(a => a.guildId === i.guildId);
   if (i.isAutocomplete()) {
     const q = i.options.getFocused();
-    return i.respond(alarms.filter(a => a.name.includes(q)).slice(0, 25).map(a => ({ name: a.name, value: a.name })));
+    return i.respond(mine.filter(a => a.name.includes(q)).slice(0, 25).map(a => ({ name: a.name, value: a.name })));
   }
   if (!i.isChatInputCommand()) return;
   const reply = content => i.reply({ content, flags: MessageFlags.Ephemeral });
   const name = i.options.getString('이름');
 
   if (i.commandName === '알림목록') {
-    return reply(alarms.length ? alarms.map(describe).join('\n') : '등록된 알림이 없습니다.');
+    return reply(mine.length ? mine.map(a => `${describe(a)} → <#${a.channelId}>`).join('\n') : '등록된 알림이 없습니다.');
   }
 
   if (i.commandName === '알림추가') {
     const time = parseTime(i.options.getString('시간'));
     const days = parseDays(i.options.getString('요일'));
+    const channel = i.options.getChannel('채널') ?? i.channel;
     if (!time) return reply('시간 형식이 잘못됐어요. 예: 21:50');
     if (days === undefined) return reply('요일 형식이 잘못됐어요. 예: 토 / 월,수,금');
-    if (alarms.some(a => a.name === name)) return reply('같은 이름의 알림이 이미 있어요.');
+    if (mine.some(a => a.name === name)) return reply('같은 이름의 알림이 이미 있어요.');
     const alarm = { name, time, days, text: i.options.getString('내용') };
-    const msg = await channel.send(`🔔 ${describe(alarm)} 알림\n받으려면 ${EMOJI}를 눌러주세요.`);
-    await msg.react(EMOJI);
-    alarms.push({ ...alarm, msgId: msg.id });
+    let msg;
+    try {
+      msg = await channel.send(`🔔 ${describe(alarm)} 알림\n받으려면 ${EMOJI}를 눌러주세요.`);
+      await msg.react(EMOJI);
+    } catch {
+      return reply(`${channel}에 메시지를 보낼 수 없어요. 봇 권한(보기/보내기/반응 추가)을 확인해주세요.`);
+    }
+    alarms.push({ ...alarm, guildId: i.guildId, channelId: channel.id, msgId: msg.id });
     save();
-    return reply(`등록했어요: ${describe(alarm)}`);
+    return reply(`등록했어요: ${describe(alarm)} → ${channel}`);
   }
 
   if (i.commandName === '알림삭제') {
-    const alarm = alarms.find(a => a.name === name);
+    const alarm = mine.find(a => a.name === name);
     if (!alarm) return reply('그런 이름의 알림이 없어요.');
     alarms = alarms.filter(a => a !== alarm);
     save();
-    await channel.messages.delete(alarm.msgId).catch(() => {}); // 이미 지워졌으면 무시
+    // 채널이나 메시지가 이미 지워졌으면 무시
+    await client.channels.fetch(alarm.channelId).then(c => c.messages.delete(alarm.msgId)).catch(() => {});
     return reply(`삭제했어요: ${alarm.name}`);
   }
 });
 
 const fired = new Set();
 client.once('clientReady', async () => {
-  channel = await client.channels.fetch(process.env.CHANNEL_ID);
-  await channel.guild.commands.set(commands); // 서버 명령어라 바로 반영됨
-  await channel.guild.members.me.setNickname('좋은하루').catch(e => console.error('닉네임 변경 실패', e.message));
+  await Promise.all(client.guilds.cache.map(setupGuild));
   console.log(`${client.user.tag} 준비 완료`);
 
   setInterval(async () => {
     const now = new Date();
     for (const alarm of alarms) {
-      const key = `${alarm.name}@${now.toISOString().slice(0, 16)}`;
+      const key = `${alarm.msgId}@${now.toISOString().slice(0, 16)}`;
       if (!due(alarm, now) || fired.has(key)) continue;
       fired.add(key);
       try {
+        const channel = await client.channels.fetch(alarm.channelId);
         const msg = await channel.messages.fetch(alarm.msgId);
         // ponytail: 반응자 100명까지만 가져옴, 더 많아지면 after로 페이지네이션
         const users = await msg.reactions.cache.get(EMOJI)?.users.fetch();
