@@ -12,9 +12,9 @@ export function due(alarm, date) {
   return hhmm === alarm.time && (!alarm.days || alarm.days.includes(kst.getUTCDay()));
 }
 
-// "월,수,금" / "월수금" / "토요일" -> [1,3,5] 등. 비우면 null(매일), 잘못되면 undefined
+// "월,수,금" / "월수금" / "토요일" -> [1,3,5] 등. 비우거나 "매일"이면 null, 잘못되면 undefined
 export function parseDays(s) {
-  if (!s) return null;
+  if (!s || s.trim() === '매일') return null;
   const days = [...s.replace(/요일|[\s,]/g, '')].map(c => DAYS.indexOf(c));
   return days.length && !days.includes(-1) ? [...new Set(days)].sort() : undefined;
 }
@@ -31,7 +31,7 @@ if (process.argv[2] === 'test') {
   console.assert(!due(weekly, new Date('2026-10-11T11:50:00Z')), 'weekly not on sun');
   console.assert(due(daily, new Date('2026-10-11T12:50:00Z')), 'daily fires');
   console.assert(String(parseDays('금, 월 수')) === '1,3,5' && String(parseDays('토요일')) === '6', 'days');
-  console.assert(parseDays('') === null && parseDays('월x') === undefined, 'days edge');
+  console.assert(parseDays('') === null && parseDays('매일') === null && parseDays('월x') === undefined, 'days edge');
   console.assert(parseTime('9:05') === '09:05' && parseTime('24:00') === null, 'time');
   console.log('ok');
   process.exit();
@@ -40,6 +40,7 @@ if (process.argv[2] === 'test') {
 let alarms = fs.existsSync(FILE) ? JSON.parse(fs.readFileSync(FILE, 'utf8')) : [];
 const save = () => fs.writeFileSync(FILE, JSON.stringify(alarms, null, 2));
 const describe = a => `**${a.name}** — ${a.days ? a.days.map(d => DAYS[d]).join(',') + '요일' : '매일'} ${a.time}`;
+const subText = a => `🔔 ${describe(a)} 알림\n받으려면 ${EMOJI}를 눌러주세요.`;
 
 const admin = PermissionFlagsBits.ManageGuild;
 const commands = [
@@ -50,6 +51,13 @@ const commands = [
     .addStringOption(o => o.setName('내용').setDescription('알림 때 보낼 문구').setRequired(true))
     .addStringOption(o => o.setName('요일').setDescription('예: 토 / 월,수,금 (비우면 매일)'))
     .addChannelOption(o => o.setName('채널').setDescription('알림 보낼 채널 (비우면 지금 채널)')
+      .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)),
+  new SlashCommandBuilder().setName('알림수정').setDescription('알림을 수정합니다 (입력한 항목만 바뀜)').setDefaultMemberPermissions(admin)
+    .addStringOption(o => o.setName('이름').setDescription('수정할 알림').setRequired(true).setAutocomplete(true))
+    .addStringOption(o => o.setName('시간').setDescription('한국시간 HH:MM (예: 21:50)'))
+    .addStringOption(o => o.setName('내용').setDescription('알림 때 보낼 문구'))
+    .addStringOption(o => o.setName('요일').setDescription('예: 토 / 월,수,금 / 매일'))
+    .addChannelOption(o => o.setName('채널').setDescription('알림 보낼 채널 (바꾸면 ✅ 체크가 초기화됨)')
       .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)),
   new SlashCommandBuilder().setName('알림삭제').setDescription('알림을 삭제합니다').setDefaultMemberPermissions(admin)
     .addStringOption(o => o.setName('이름').setDescription('삭제할 알림').setRequired(true).setAutocomplete(true)),
@@ -88,7 +96,7 @@ client.on('interactionCreate', async i => {
     const alarm = { name, time, days, text: i.options.getString('내용') };
     let msg;
     try {
-      msg = await channel.send(`🔔 ${describe(alarm)} 알림\n받으려면 ${EMOJI}를 눌러주세요.`);
+      msg = await channel.send(subText(alarm));
       await msg.react(EMOJI);
     } catch {
       return reply(`${channel}에 메시지를 보낼 수 없어요. 봇 권한(보기/보내기/반응 추가)을 확인해주세요.`);
@@ -96,6 +104,35 @@ client.on('interactionCreate', async i => {
     alarms.push({ ...alarm, guildId: i.guildId, channelId: channel.id, msgId: msg.id });
     save();
     return reply(`등록했어요: ${describe(alarm)} → ${channel}`);
+  }
+
+  if (i.commandName === '알림수정') {
+    const alarm = mine.find(a => a.name === name);
+    if (!alarm) return reply('그런 이름의 알림이 없어요.');
+    const timeIn = i.options.getString('시간'), daysIn = i.options.getString('요일');
+    const time = timeIn ? parseTime(timeIn) : alarm.time;
+    const days = daysIn ? parseDays(daysIn) : alarm.days;
+    if (!time) return reply('시간 형식이 잘못됐어요. 예: 21:50');
+    if (days === undefined) return reply('요일 형식이 잘못됐어요. 예: 토 / 월,수,금 / 매일');
+    const updated = { ...alarm, time, days, text: i.options.getString('내용') ?? alarm.text };
+    const newChannel = i.options.getChannel('채널');
+    const old = await client.channels.fetch(alarm.channelId).catch(() => null);
+    try {
+      if (newChannel && newChannel.id !== alarm.channelId) {
+        // 채널이 바뀌면 구독 메시지를 새로 올림 (✅ 체크는 새로 받아야 함)
+        const msg = await newChannel.send(subText(updated));
+        await msg.react(EMOJI);
+        await old?.messages.delete(alarm.msgId).catch(() => {});
+        Object.assign(updated, { channelId: newChannel.id, msgId: msg.id });
+      } else {
+        await old.messages.edit(alarm.msgId, subText(updated));
+      }
+    } catch {
+      return reply('구독 메시지를 수정할 수 없어요. 봇 권한이나 메시지가 지워졌는지 확인해주세요.');
+    }
+    alarms[alarms.indexOf(alarm)] = updated;
+    save();
+    return reply(`수정했어요: ${describe(updated)} → <#${updated.channelId}>`);
   }
 
   if (i.commandName === '알림삭제') {
